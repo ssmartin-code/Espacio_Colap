@@ -88,6 +88,67 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LightSource
 
+# rasterio trae su propio proj.db (compatible con SU versión de PROJ). Lo usamos
+# SOLO al escribir rásters, vía rasterio.Env, sin tocar el PROJ de pyproj.
+_RIO_PROJ = os.path.join(os.path.dirname(rasterio.__file__), "proj_data")
+if not os.path.isfile(os.path.join(_RIO_PROJ, "proj.db")):
+    _RIO_PROJ = None
+
+
+def _wkt_desde_epsg(epsg):
+    """Obtiene el WKT del CRS usando pyproj (que sí funciona), evitando que
+    rasterio/GDAL tenga que resolver el código EPSG contra su proj.db."""
+    try:
+        import pyproj
+        return pyproj.CRS.from_epsg(epsg).to_wkt()
+    except Exception:
+        return None
+
+
+def escribir_geotiff(path, array, transform, epsg, nx, ny):
+    """Escribe un GeoTIFF de forma robusta frente a conflictos de PROJ.
+
+    1) Intenta con el CRS en formato WKT (derivado por pyproj) — no requiere
+       que GDAL resuelva el código EPSG contra su proj.db.
+    2) Si falla, escribe el ráster SIN CRS (asignable luego en QGIS) y avisa.
+    """
+    base = dict(driver="GTiff", height=ny, width=nx, count=1,
+                dtype="float32", transform=transform, nodata=np.nan)
+    env_kw = dict(PROJ_DATA=_RIO_PROJ, PROJ_LIB=_RIO_PROJ) if _RIO_PROJ else {}
+    wkt = _wkt_desde_epsg(epsg)
+    try:
+        crs = rasterio.crs.CRS.from_wkt(wkt) if wkt else f"EPSG:{epsg}"
+        with rasterio.Env(**env_kw):
+            with rasterio.open(path, "w", crs=crs, **base) as dst:
+                dst.write(array.astype(np.float32), 1)
+        return True
+    except Exception as e:
+        log(f"    AVISO PROJ: no se pudo incrustar el CRS ({type(e).__name__}).")
+        with rasterio.open(path, "w", crs=None, **base) as dst:
+            dst.write(array.astype(np.float32), 1)
+        log(f"    -> GeoTIFF escrito SIN CRS. Asigna EPSG:{epsg} en QGIS "
+            f"(Capa > Establecer SRC) si lo necesitas georreferenciado.")
+        return False
+
+
+def escribir_vector(gdf, path, epsg):
+    """Escribe un GeoPackage de forma robusta frente a conflictos de PROJ."""
+    try:
+        gdf.to_file(path, driver="GPKG")
+        return True
+    except Exception as e:
+        log(f"    AVISO PROJ al escribir {os.path.basename(path)} "
+            f"({type(e).__name__}); reintento sin CRS incrustado.")
+        g2 = gdf.copy()
+        try:
+            g2 = g2.set_crs(None, allow_override=True)
+        except Exception:
+            pass
+        g2.to_file(path, driver="GPKG")
+        log(f"    -> {os.path.basename(path)} escrito SIN CRS "
+            f"(asigna EPSG:{epsg} en QGIS si lo necesitas).")
+        return False
+
 
 # =============================================================================
 #  CONFIGURACIÓN  (todo lo "calibrable" vive aquí)
@@ -293,12 +354,9 @@ def paso1_altura(pts, parcela, dirs, cfg: Config):
         transform=transform, fill=0, dtype="uint8").astype(bool)
     chm_parcela = np.where(mask, chm, np.nan)
 
-    # Exportar GeoTIFF del CHM
+    # Exportar GeoTIFF del CHM (con manejo robusto del CRS / PROJ)
     tif = os.path.join(dirs["altura"], "CHM_alturas.tif")
-    with rasterio.open(tif, "w", driver="GTiff", height=ny, width=nx,
-                       count=1, dtype="float32", crs=f"EPSG:{cfg.epsg}",
-                       transform=transform, nodata=np.nan) as dst:
-        dst.write(chm_parcela.astype(np.float32), 1)
+    escribir_geotiff(tif, chm_parcela, transform, cfg.epsg, nx, ny)
     log(f"    CHM -> {tif}")
 
     valid = chm_parcela[np.isfinite(chm_parcela)]
@@ -416,12 +474,12 @@ def paso2_copas(chm, transform, mask, dirs, cfg: Config):
 
     gdf = gpd.GeoDataFrame(registros, crs=f"EPSG:{cfg.epsg}")
     gpkg = os.path.join(dirs["copas"], "copas_segmentadas.gpkg")
-    gdf.to_file(gpkg, driver="GPKG")
+    escribir_vector(gdf, gpkg, cfg.epsg)
     cimas = gpd.GeoDataFrame(
         gdf[["tree_id", "h_max"]].copy(),
         geometry=[Point(xy) for xy in zip(gdf.cima_x, gdf.cima_y)],
         crs=f"EPSG:{cfg.epsg}")
-    cimas.to_file(os.path.join(dirs["copas"], "cimas_arboles.gpkg"), driver="GPKG")
+    escribir_vector(cimas, os.path.join(dirs["copas"], "cimas_arboles.gpkg"), cfg.epsg)
     log(f"    Copas -> {gpkg}")
     return gdf, labels
 
@@ -492,7 +550,7 @@ def paso3_especies(gdf, labels, pts, parcela, dirs, transform, cfg: Config):
     log(f"    Pinar: {n_pino} árboles | Alcornocal: {n_alc} árboles")
 
     gpkg = os.path.join(dirs["especies"], "copas_especies.gpkg")
-    gdf.to_file(gpkg, driver="GPKG")
+    escribir_vector(gdf, gpkg, cfg.epsg)
     _mapa_especies_png(gdf, parcela,
                        os.path.join(dirs["especies"], "mapa_especies.png"), cfg)
     log(f"    Especies -> {gpkg}")
