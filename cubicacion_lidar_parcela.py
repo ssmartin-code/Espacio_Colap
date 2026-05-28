@@ -37,6 +37,32 @@ import json
 import argparse
 from dataclasses import dataclass, field, asdict
 
+# --- Resolver conflicto PROJ con PostgreSQL/PostGIS en Windows ---------------
+# Si PostgreSQL tiene una versión antigua de proj.db, rasterio/pyproj fallan.
+# Forzamos el uso del proj.db de la instalación de Python (conda/pip).
+_conda_root = os.path.dirname(sys.executable)
+_proj_candidates = [
+    os.path.join(_conda_root, "Library", "share", "proj"),   # miniconda base
+    os.path.join(_conda_root, "..", "Library", "share", "proj"),  # conda env
+    os.path.join(_conda_root, "share", "proj"),               # Linux/Mac
+]
+for _p in _proj_candidates:
+    _p = os.path.normpath(_p)
+    if os.path.isfile(os.path.join(_p, "proj.db")):
+        os.environ["PROJ_DATA"] = _p
+        os.environ["PROJ_LIB"]  = _p
+        break
+else:
+    try:
+        import pyproj as _pp
+        _p = _pp.datadir.get_data_dir()
+        os.environ.setdefault("PROJ_DATA", _p)
+        os.environ.setdefault("PROJ_LIB",  _p)
+    except Exception:
+        pass
+os.environ.setdefault("CPL_LOG_ERRORS", "OFF")   # silencia avisos DLL 32-bit
+# -----------------------------------------------------------------------------
+
 # Catastro a veces entrega SHP sin .shx; esto permite reconstruirlo.
 os.environ.setdefault("SHAPE_RESTORE_SHX", "YES")
 
